@@ -1,17 +1,39 @@
-import { randomUUID } from "node:crypto";
-
 import { NextResponse } from "next/server";
 
 import { AppError, getErrorMessage } from "@/lib/errors";
 import { extractTextFromFile } from "@/lib/rag/extractText";
-import { chunkText } from "@/lib/rag/chunkText";
-import { embedTexts } from "@/lib/rag/embeddings";
-import { upsertChunks } from "@/lib/rag/vectorStore";
+import { indexExtractedDocument } from "@/lib/rag/index-document";
 import { getServerConfig } from "@/lib/server-config";
+import type { VectorStoreProvider } from "@/lib/types";
 import { validateUploadSize } from "@/lib/uploads/validation";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
+
+function normalizeOptionalFormValue(value: FormDataEntryValue | null): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const normalizedValue = value.trim();
+  return normalizedValue.length > 0 ? normalizedValue : undefined;
+}
+
+function parseOptionalStorage(
+  value: FormDataEntryValue | null,
+): VectorStoreProvider | undefined {
+  const normalizedValue = normalizeOptionalFormValue(value);
+
+  if (!normalizedValue) {
+    return undefined;
+  }
+
+  if (normalizedValue === "qdrant" || normalizedValue === "memory") {
+    return normalizedValue;
+  }
+
+  throw new AppError("Invalid storage provider.", 400);
+}
 
 export async function POST(request: Request) {
   try {
@@ -26,6 +48,8 @@ export async function POST(request: Request) {
 
     const formData = await request.formData();
     const file = formData.get("file");
+    const workspaceId = normalizeOptionalFormValue(formData.get("workspaceId"));
+    const preferredStorage = parseOptionalStorage(formData.get("storage"));
 
     if (!(file instanceof File)) {
       throw new AppError("Please choose a file to upload.", 400);
@@ -38,8 +62,6 @@ export async function POST(request: Request) {
     });
 
     const buffer = Buffer.from(await file.arrayBuffer());
-    const documentId = randomUUID();
-
     let extractedDocument;
 
     try {
@@ -56,60 +78,18 @@ export async function POST(request: Request) {
       throw new AppError("We couldn't extract readable text from that file.", 400);
     }
 
-    const chunks = chunkText({
-      documentId,
+    const indexedSource = await indexExtractedDocument({
+      workspaceId,
+      sourceName: extractedDocument.fileName,
+      sourceType: extractedDocument.fileType,
       fileName: extractedDocument.fileName,
       fileType: extractedDocument.fileType,
       text: extractedDocument.text,
       pages: extractedDocument.pages,
+      storage: preferredStorage,
     });
 
-    if (chunks.length === 0) {
-      throw new AppError(
-        "The uploaded document did not produce any searchable chunks.",
-        400,
-      );
-    }
-
-    let embeddings;
-
-    try {
-      embeddings = await embedTexts(chunks.map((chunk) => chunk.text));
-    } catch (error) {
-      if (error instanceof AppError) {
-        throw error;
-      }
-
-      throw new AppError(
-        "We couldn't generate embeddings for the uploaded document.",
-        502,
-      );
-    }
-
-    let storage;
-
-    try {
-      storage = await upsertChunks(documentId, chunks, embeddings);
-    } catch (error) {
-      if (error instanceof AppError) {
-        throw error;
-      }
-
-      throw new AppError(
-        "We couldn't store the document in the vector database.",
-        502,
-      );
-    }
-
-    return NextResponse.json({
-      success: true,
-      documentId,
-      fileName: extractedDocument.fileName,
-      fileType: extractedDocument.fileType,
-      chunkCount: chunks.length,
-      pageCount: extractedDocument.pageCount,
-      storage,
-    });
+    return NextResponse.json(indexedSource);
   } catch (error) {
     const statusCode = error instanceof AppError ? error.statusCode : 500;
     return NextResponse.json(

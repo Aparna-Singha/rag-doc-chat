@@ -1,97 +1,183 @@
 # Ask My Doc RAG
 
-Ask My Doc RAG is a document question-answering web application built for a Retrieval-Augmented Generation assignment. A user uploads one document, the app indexes that document through a RAG pipeline, and the chat UI answers questions using only retrieved content from the uploaded file.
+Ask My Doc RAG is a grounded question-answering app built with `Next.js`, `TypeScript`, `Gemini`, and `Qdrant`. It indexes user-provided sources into a workspace and answers questions only from retrieved workspace context.
 
-For this submission, `PDF`, `TXT`, and `CSV` document flows were tested. The app shows source chunks with answers, answers only from retrieved document context, and says `I could not find this information in the uploaded document.` when the answer is not present in the uploaded file.
+The current implementation supports:
 
-## Problem Statement
+- `PDF`, `TXT`, and `CSV` file uploads
+- optional public web page ingestion
+- multi-source workspaces in one session
+- workspace-wide retrieval
+- Corrective RAG with retrieval grading, one rewrite attempt, a second retrieval pass, and honest refusal when context is insufficient
 
-Many LLM-based chat apps answer from general model knowledge, which can lead to hallucinations when the user wants answers from a specific document. This project solves that problem by letting users upload a `PDF`, `TXT`, or `CSV` file and ask natural-language questions grounded only in that document.
+If the indexed sources do not contain enough information, the app returns:
+
+`I could not find this information in the uploaded document.`
+
+## What It Does
+
+Ask My Doc RAG is designed for source-grounded Q&A:
+
+- users can upload multiple files into one active workspace
+- users can add a public URL as another source in that same workspace
+- chunks are embedded with Gemini and stored in Qdrant, with an in-memory fallback during local development
+- chat retrieves from all sources in the active workspace instead of only one file
+- source metadata is preserved so answers can show source type, source name, score, and page or URL details
 
 ## Features
 
-- Upload a single `PDF`, `TXT`, or `CSV` document from the browser
-- Validate supported file types and maximum upload size
-- Extract readable text on the server
-- Handle `CSV` files by converting rows into readable structured text before chunking
-- Split extracted content into retrieval-friendly overlapping chunks
-- Generate embeddings using the Gemini API
-- Store chunk embeddings in Qdrant
-- Fall back to an in-memory vector store during local development when Qdrant is unavailable
-- Retrieve relevant chunks using `documentId` filtering so different uploads do not mix
-- Ask grounded questions through a chat interface
-- Show source chunks under each assistant answer
-- Return a fallback answer when the information is not present in the uploaded document
+- Upload `PDF`, `TXT`, and `CSV` documents
+- Add a public `WEB` source by URL
+- Group sources into one active workspace during the current session
+- Keep uploaded file support and the existing Gemini + Qdrant pipeline
+- Retrieve only from indexed chunks in the active workspace
+- Use Corrective RAG before answer generation
+- Show source-aware answer cards with `PDF`, `TXT`, `CSV`, or `WEB` badges
+- Refuse to answer when no indexed source contains enough supporting context
 
 ## Demo Screenshots
 
-### CSV Document Question Answering
-
-Shows CSV upload, indexing, retrieval, and answer generation from tabular data.
+### CSV Question Answering
 
 ![CSV question answering](public/screenshots/csv-query.png)
 
-### TXT Document Question Answering
-
-Shows TXT upload, chunking, retrieval, and grounded answer generation.
+### TXT Question Answering
 
 ![TXT question answering](public/screenshots/txt-query.png)
 
-### PDF Document Question Answering
-
-Shows PDF upload, indexing, source chunks, and answer generation.
+### PDF Question Answering
 
 ![PDF question answering](public/screenshots/pdf-query.png)
 
-### Grounded Answer / Hallucination Prevention
-
-When the uploaded document does not contain the answer, the app refuses to guess.
+### Grounded Refusal
 
 ![Grounded refusal](public/screenshots/grounded-refusal.png)
 
 ## Tech Stack
 
-- `Next.js` with App Router
+- `Next.js` App Router
 - `TypeScript`
 - `Tailwind CSS`
 - `Gemini API` via `@google/genai`
-- `Qdrant` for vector storage
-- `pdf-parse` for PDF text extraction
-- `Papa Parse` for CSV parsing
+- `Qdrant` vector storage
+- `pdf-parse` for PDF extraction
+- `Papa Parse` for CSV extraction
+- `cheerio` for HTML parsing during URL ingestion
 - `Docker` for local Qdrant setup
 
-## RAG Pipeline
+## Multi-Source Workspace
 
-The application follows this pipeline:
+The app now uses a workspace-oriented retrieval model.
 
-Upload document
--> Extract text
+- each indexed source gets its own `sourceId`
+- the active session keeps a `workspaceId`
+- all chunks store workspace and source metadata
+- chat retrieval is filtered by `workspaceId`
+- chunks from other workspaces are not mixed into the current session
+
+Source metadata stored with each chunk includes:
+
+- `workspaceId`
+- `sourceId`
+- `documentId` as a backward-compatible alias for the source id
+- `sourceName`
+- `sourceType`
+- `sourceUrl` for web sources
+- `fileName` and `fileType` when the source came from an uploaded file
+- `chunkIndex`
+- `pageNumber` when available
+- `snippet`
+- `text`
+
+## URL Ingestion
+
+Users can add a public web page through `POST /api/ingest-url`.
+
+Behavior:
+
+- only `http` and `https` URLs are accepted
+- localhost, loopback, and obvious private-network targets are rejected
+- the page is fetched once during ingestion
+- the app does not browse live during chat
+- the HTML is parsed server-side with `cheerio`
+- script, style, and common navigation noise are removed where possible
+- readable text is chunked, embedded, and stored as a `WEB` source
+
+Security and operational safeguards:
+
+- no browser automation
+- no JavaScript execution
+- fetch timeout
+- HTML byte limit
+- redirect cap
+
+## Corrective RAG
+
+The existing Corrective RAG flow is preserved and now runs across the active workspace.
+
+For each chat question:
+
+1. the app embeds the question
+2. it retrieves top chunks from the active workspace
+3. it grades whether the retrieved context is strong enough
+4. if the first retrieval passes, it answers normally
+5. if the first retrieval is weak, it rewrites the query once
+6. it retrieves again from the same workspace
+7. if the second retrieval is still weak, it refuses instead of hallucinating
+
+The corrective metadata returned by the chat API includes:
+
+- `enabled`
+- `initialQuery`
+- `rewrittenQuery` when used
+- `initialRetrievalPassed`
+- `secondRetrievalUsed`
+- `finalRetrievalPassed`
+- `reason`
+- `retrievalMode`
+
+`retrievalMode` is one of:
+
+- `direct`
+- `corrected`
+- `insufficient_context`
+
+## Retrieval and Generation Pipeline
+
+The current architecture is:
+
+File or URL source
+-> Extract readable text
 -> Chunk text
--> Create embeddings
--> Store embeddings in vector DB
--> Retrieve relevant chunks
--> Send context to LLM
--> Generate grounded answer
+-> Create Gemini embeddings
+-> Store vectors in Qdrant with workspace and source metadata
+-> Retrieve across the active workspace
+-> Grade retrieved context
+-> If weak, rewrite query
+-> Retrieve again
+-> Generate grounded answer or refuse
 
 More concretely:
 
-1. The user uploads a supported file.
-2. The backend validates the file type and size.
-3. The server extracts text based on the file format.
-4. The extracted text is split into overlapping chunks.
-5. Gemini creates embeddings for each chunk.
-6. The chunk embeddings are stored in Qdrant, or in memory during local development if Qdrant is unavailable.
-7. When the user asks a question, the app embeds the question and retrieves the top matching chunks for that document only.
-8. Only those retrieved chunks are sent to Gemini for answer generation.
-9. The app returns the answer plus the source chunks used.
+1. A user uploads a file or adds a public web page.
+2. The backend extracts readable text.
+3. The source is split into retrieval-friendly chunks.
+4. Gemini creates embeddings for those chunks.
+5. The vectors are stored with workspace and source metadata.
+6. When the user asks a question, the app retrieves across all indexed sources in the active workspace.
+7. Corrective RAG decides whether the retrieval is good enough.
+8. The answer generator uses only the final retrieved chunks.
+9. If the workspace does not contain enough supporting context, the app refuses to answer.
 
-## Supported Files
+## Supported Sources
+
+### File Uploads
 
 - `PDF`
 - `TXT`
 - `CSV`
 
-The upload API accepts these extensions and MIME types:
+Accepted file extensions and MIME types:
 
 - `.pdf`
 - `.txt`
@@ -102,22 +188,13 @@ The upload API accepts these extensions and MIME types:
 - `application/csv`
 - `application/vnd.ms-excel`
 
+### Web Sources
+
+- public `http` and `https` pages only
+
 ## CSV Handling
 
-CSV files are not treated as raw comma-separated strings. The app parses them with a CSV parser and converts each row into structured readable text before chunking. This makes tabular data easier for embeddings, retrieval, and the final LLM answer.
-
-Example transformed row:
-
-```text
-Row 1: name: Aparna; marks: 92; subject: DBMS
-```
-
-In the current implementation:
-
-- the first row is treated as headers
-- empty lines are skipped
-- malformed CSV input returns a clean error
-- the extracted text includes a columns line plus readable row lines
+CSV files are parsed into readable row text before chunking so that embeddings and retrieval work better on tabular content.
 
 Example shape:
 
@@ -129,98 +206,150 @@ Row 2: name: Lekhana; marks: 88; subject: OS
 
 ## Chunking Strategy
 
-The chunking module is designed for retrieval quality while keeping chunks readable.
+The chunker is still optimized for readable retrieval units.
 
-- Target chunk size: `900-1200` characters
-- Overlap: `180` characters
-- Paragraph-aware splitting is preferred first
-- If needed, the chunker falls back to sentence, whitespace, or character-based boundaries
-- Empty chunks are skipped
+- target chunk size: `900-1200` characters
+- overlap: `180` characters
+- paragraph and sentence boundaries are preferred when possible
+- empty chunks are skipped
 
-Why overlap helps:
+## Vector Storage
 
-- Important information can sit near the end of one chunk and the beginning of the next
-- Overlap reduces the chance that retrieval misses context split across chunk boundaries
-- This improves answer grounding for questions that depend on nearby text
-
-## Vector Database
-
-This project uses `Qdrant` as the main vector database.
+Qdrant remains the primary vector store.
 
 Current behavior:
 
-- a collection is created automatically if it does not exist
-- each stored point contains the vector plus chunk metadata
-- retrieval is filtered by `documentId`
-- chunks from different uploads are not mixed during search
-- very low-confidence retrieval results are discarded before answer generation
-
-Stored chunk metadata includes:
-
-- `documentId`
-- `fileName`
-- `fileType`
-- `chunkIndex`
-- `pageNumber` when available
-- `text`
-- `snippet`
+- a collection is created automatically if needed
+- chunk payloads include workspace and source metadata
+- retrieval is filtered by `workspaceId` for normal workspace chat
+- backward-compatible document-level retrieval can still use `documentId`
+- an in-memory fallback is available during local development when Qdrant is unavailable
 
 ### In-Memory Fallback
 
-An in-memory vector store is also implemented for local development.
+The in-memory vector store is intended only for local development.
 
-Use case:
-
-- local `next dev` testing when Qdrant is not running or not reachable
-
-Limitations:
-
-- not persistent
-- cleared when the server restarts
-- not suitable for production or Vercel deployment
+- it is not persistent
+- it is cleared on server restart
+- it is not suitable for production or hosted deployments
 
 ## Grounded Answering Rules
 
-The chat route uses retrieved chunks only. The answer generator is instructed to:
+The answer generator is instructed to:
 
-- answer only from the provided document context
-- not use outside knowledge
-- not guess
-- return `I could not find this information in the uploaded document.` when the answer is not supported by the retrieved context
-- return the same fallback answer when retrieval does not find sufficiently relevant chunks
+- answer only from the provided retrieved context
+- avoid outside knowledge
+- avoid guessing
+- return the refusal message when the answer is not supported by the indexed sources
 
-This helps keep answers grounded and assignment-appropriate.
+## API Summary
+
+### `POST /api/upload`
+
+Accepts multipart form data with:
+
+- `file`
+- optional `workspaceId`
+- optional `storage`
+
+Returns JSON including:
+
+- `success`
+- `workspaceId`
+- `sourceId`
+- `documentId`
+- `sourceName`
+- `sourceType`
+- `chunkCount`
+- `pageCount`
+- `fileName`
+- `fileType`
+- `storage`
+
+### `POST /api/ingest-url`
+
+Accepts JSON:
+
+```json
+{
+  "workspaceId": "optional",
+  "url": "https://example.com",
+  "storage": "optional"
+}
+```
+
+Returns JSON including:
+
+- `success`
+- `workspaceId`
+- `sourceId`
+- `documentId`
+- `sourceName`
+- `sourceType`
+- `chunkCount`
+- `pageCount`
+- `url`
+- `storage`
+
+### `POST /api/chat`
+
+Accepts JSON:
+
+```json
+{
+  "workspaceId": "optional",
+  "documentId": "optional backward-compatible alias",
+  "question": "What does this source say?",
+  "storage": "optional"
+}
+```
+
+Returns JSON including:
+
+- `answer`
+- `sources`
+- `corrective`
+
+Each source entry includes:
+
+- `sourceId`
+- `sourceName`
+- `sourceType`
+- `chunkIndex`
+- `score`
+- `page` when available
+- `url` for web sources
+- `text` as a readable snippet
 
 ## Environment Variables
 
-Create a `.env.local` file from `.env.example`.
+Create `.env.local` from `.env.example`.
 
-Required and commonly used variables:
+Required and common variables:
 
 ```env
 GEMINI_API_KEY=
-QDRANT_URL=
-QDRANT_API_KEY=
-QDRANT_COLLECTION_NAME=
-```
-
-The example file in this project also includes:
-
-```env
 GEMINI_MODEL=gemini-2.5-flash
 GEMINI_EMBEDDING_MODEL=gemini-embedding-001
+QDRANT_URL=
+QDRANT_API_KEY=
+QDRANT_COLLECTION_NAME=ask_my_doc_rag
 RAG_TOP_K=5
+RAG_MIN_RELEVANCE_SCORE=0.55
 MAX_FILE_SIZE_MB=10
+URL_MAX_BYTES=2000000
+URL_FETCH_TIMEOUT_MS=10000
 ```
 
 Notes:
 
 - `GEMINI_API_KEY` is required
-- `QDRANT_URL` is required for deployed environments and should point to your local Docker instance or Qdrant Cloud cluster
-- `QDRANT_API_KEY` is optional unless your Qdrant instance requires authentication
-- `QDRANT_COLLECTION_NAME` lets you choose the collection name
-- during local development, if `QDRANT_URL` is left blank, the app first tries `http://127.0.0.1:6333`
-- `.env.local` should not be committed
+- `QDRANT_URL` is required for deployed environments
+- `QDRANT_API_KEY` is optional unless your Qdrant deployment requires it
+- `RAG_TOP_K` controls how many chunks are retrieved before filtering and grading
+- `RAG_MIN_RELEVANCE_SCORE` sets the first score threshold before the LLM relevance check runs
+- `URL_MAX_BYTES` limits fetched HTML or text size during URL ingestion
+- `URL_FETCH_TIMEOUT_MS` limits how long URL fetches can run
 
 ## Local Setup
 
@@ -230,140 +359,45 @@ Notes:
 npm install
 ```
 
-2. Create your local environment file:
+2. Create a local environment file:
 
 ```bash
 cp .env.example .env.local
 ```
 
-3. Add your Gemini API key in `.env.local`.
-4. Keep `.env.local` uncommitted. The repository includes `.env.example` for safe sharing.
+3. Add your Gemini API key and any Qdrant settings.
 
-5. Start Qdrant locally with Docker:
-
-```bash
-docker run -d --name ask-my-doc-rag-qdrant -p 6333:6333 -p 6334:6334 qdrant/qdrant
-```
-
-The repository also includes a Docker Compose setup, so this works too:
+4. Start Qdrant locally:
 
 ```bash
 npm run qdrant:up
 ```
 
-6. Start the Next.js development server:
+5. Start the development server:
 
 ```bash
 npm run dev
 ```
 
-7. Open:
+6. Open:
 
 ```text
 http://localhost:3000
 ```
 
-## Deployment Instructions
+## Deployment Notes
 
-### Option 1: Vercel for the Next.js App
+- hosted deployments should use a real Qdrant instance
+- the in-memory fallback should not be relied on in production
+- workspace state is session-local in the current UI and is not tied to user accounts
 
-This project can be deployed as a fullstack Next.js app on Vercel because the upload and chat logic lives in Next.js API routes and runs on the Node.js runtime.
+## Limitations
 
-Steps:
-
-1. Push the project to a GitHub repository.
-2. Import the repository into Vercel.
-3. Add the environment variables in the Vercel project settings.
-4. Connect the deployed app to a reachable Qdrant instance.
-5. Deploy.
-
-### Option 2: Qdrant Cloud
-
-For production or demo deployment, use `Qdrant Cloud` instead of local Docker.
-
-You would typically:
-
-1. Create a Qdrant Cloud cluster.
-2. Copy the cluster URL into `QDRANT_URL`.
-3. Add the cloud API key to `QDRANT_API_KEY` if required.
-4. Keep `QDRANT_COLLECTION_NAME` set to the collection you want this project to use.
-
-### Environment Variables for Deployment
-
-At minimum, set:
-
-```env
-GEMINI_API_KEY=
-QDRANT_URL=
-QDRANT_API_KEY=
-QDRANT_COLLECTION_NAME=
-```
-
-You may also set:
-
-```env
-GEMINI_MODEL=
-GEMINI_EMBEDDING_MODEL=
-RAG_TOP_K=
-MAX_FILE_SIZE_MB=
-```
-
-### Honest Production Notes
-
-- The in-memory fallback is useful for local development, not production
-- Production and Vercel deployments should use a real Qdrant instance
-- If `QDRANT_URL` is missing in a deployed environment, the API returns a clear configuration error
-- If `GEMINI_API_KEY` is missing, Gemini-powered upload and chat requests return a clear configuration error
-- A deployed app should use a persistent Qdrant instance
-- The app currently focuses on one uploaded document flow in the UI
-- There is no authentication or multi-user document ownership layer in this version
-
-## Assignment Marking Coverage
-
-This section maps the project to common assignment evaluation criteria.
-
-### 1. GitHub Repo
-
-- The codebase is organized and ready to be pushed to GitHub
-- The repository contains modular source code, environment examples, Docker setup, and documentation
-
-Note:
-
-- This README does not claim the repository has already been pushed unless you do that separately
-
-### 2. Live Project
-
-- The app is ready for deployment on Vercel with a reachable Qdrant instance
-
-Note:
-
-- A live URL is not included here unless you deploy it separately
-
-### 3. RAG Pipeline
-
-- Implemented end to end
-- Upload
-- Extraction
-- Chunking
-- Embeddings
-- Vector storage
-- Retrieval
-- Grounded generation
-
-### 4. Grounded Answers
-
-- Retrieval is filtered by `documentId`
-- Only retrieved chunks are sent to the LLM
-- The model is explicitly instructed not to use outside knowledge
-- The API returns source chunks for transparency
-
-### 5. Code Quality and Documentation
-
-- TypeScript-based implementation
-- Modular backend files for extraction, chunking, embeddings, vector storage, retrieval, and answer generation
-- Upload and chat APIs separated cleanly
-- Frontend connected to real APIs
-- README and `.env.example` included
+- scanned PDFs without selectable text are not supported
+- URL extraction may miss content on heavily scripted pages
+- no user authentication or saved accounts
+- large files and large web pages may be limited by host or function limits
+- the current UI keeps one active workspace in memory for the current session
 
 ## Project Structure
 
@@ -372,6 +406,7 @@ src/
   app/
     api/
       chat/route.ts
+      ingest-url/route.ts
       upload/route.ts
     globals.css
     layout.tsx
@@ -380,14 +415,19 @@ src/
     ask-my-doc-app.tsx
   lib/
     client/
+      ingest-url.ts
       upload-document.ts
     rag/
       answer.ts
       chunkText.ts
+      correctiveRag.ts
       embeddings.ts
       extractText.ts
+      gradeRetrieval.ts
+      index-document.ts
+      ingest-url.ts
       retrieval.ts
-      text.ts
+      rewriteQuery.ts
       vectorStore.ts
       extractors/
         csv.ts
@@ -412,19 +452,3 @@ npm run lint
 npm run qdrant:up
 npm run qdrant:down
 ```
-
-## Current Scope
-
-This project intentionally stays within the scope of the assignment:
-
-- one-document upload and questioning flow in the UI
-- grounded answer generation from retrieved chunks
-- source chunk display for transparency
-
-It does not currently implement:
-
-- user authentication
-- multi-document notebooks
-- persistent application database for user sessions
-- streaming chat responses
-- advanced citation formatting beyond source chunk display

@@ -28,6 +28,9 @@ const serverConfigSchema = z.object({
   qdrantApiKey: z.string().optional(),
   qdrantCollectionName: z.string().min(1).default("ask_my_doc_rag"),
   ragTopK: z.coerce.number().int().positive().default(5),
+  ragMinRelevanceScore: z.coerce.number().min(0).max(1).default(0.55),
+  urlMaxBytes: z.coerce.number().int().positive().default(2_000_000),
+  urlFetchTimeoutMs: z.coerce.number().int().positive().default(10_000),
   maxFileSizeMb: z.coerce.number().positive().default(DEFAULT_MAX_UPLOAD_SIZE_MB),
 });
 
@@ -52,6 +55,9 @@ export function getServerConfig(): ServerConfig {
       process.env.QDRANT_COLLECTION_NAME,
     ),
     ragTopK: process.env.RAG_TOP_K,
+    ragMinRelevanceScore: process.env.RAG_MIN_RELEVANCE_SCORE,
+    urlMaxBytes: process.env.URL_MAX_BYTES,
+    urlFetchTimeoutMs: process.env.URL_FETCH_TIMEOUT_MS,
     maxFileSizeMb: process.env.MAX_FILE_SIZE_MB,
   });
 

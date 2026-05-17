@@ -1,4 +1,4 @@
-import type { UploadResult } from "@/lib/types";
+import type { UploadResult, VectorStoreProvider } from "@/lib/types";
 
 export interface UploadProgressState {
   progress: number;
@@ -13,12 +13,25 @@ interface UploadErrorResponse {
 export function uploadDocumentWithProgress(
   file: File,
   onProgress: (state: UploadProgressState) => void,
+  options?: {
+    workspaceId?: string;
+    storage?: VectorStoreProvider;
+  },
 ): Promise<UploadResult> {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
     const formData = new FormData();
 
     formData.append("file", file);
+
+    if (options?.workspaceId) {
+      formData.append("workspaceId", options.workspaceId);
+    }
+
+    if (options?.storage) {
+      formData.append("storage", options.storage);
+    }
+
     request.open("POST", "/api/upload");
     request.responseType = "json";
 

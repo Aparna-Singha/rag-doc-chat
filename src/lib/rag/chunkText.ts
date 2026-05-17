@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 
-import type { ExtractedPage, SupportedFileType, DocumentChunk } from "@/lib/types";
+import type {
+  DocumentChunk,
+  ExtractedPage,
+  SourceType,
+  SupportedFileType,
+} from "@/lib/types";
 
 const MIN_CHUNK_CHARS = 900;
 const MAX_CHUNK_CHARS = 1_200;
@@ -134,9 +139,13 @@ function findNextChunkStart(text: string, currentEnd: number): number {
 }
 
 function buildPageChunks(params: {
-  documentId: string;
-  fileName: string;
-  fileType: SupportedFileType;
+  workspaceId: string;
+  sourceId: string;
+  sourceName: string;
+  sourceType: SourceType;
+  sourceUrl?: string | null;
+  fileName?: string | null;
+  fileType?: SupportedFileType | null;
   page: ExtractedPage;
   startingChunkIndex: number;
 }): DocumentChunk[] {
@@ -156,9 +165,14 @@ function buildPageChunks(params: {
     if (chunkText) {
       chunks.push({
         id: randomUUID(),
-        documentId: params.documentId,
-        fileName: params.fileName,
-        fileType: params.fileType,
+        workspaceId: params.workspaceId,
+        sourceId: params.sourceId,
+        documentId: params.sourceId,
+        sourceName: params.sourceName,
+        sourceType: params.sourceType,
+        sourceUrl: params.sourceUrl ?? null,
+        fileName: params.fileName ?? null,
+        fileType: params.fileType ?? null,
         chunkIndex: params.startingChunkIndex + chunks.length,
         pageNumber: params.page.pageNumber,
         snippet: createSnippet(chunkText),
@@ -178,9 +192,13 @@ function buildPageChunks(params: {
 }
 
 export function chunkText(params: {
-  documentId: string;
-  fileName: string;
-  fileType: SupportedFileType;
+  workspaceId: string;
+  sourceId: string;
+  sourceName: string;
+  sourceType: SourceType;
+  sourceUrl?: string | null;
+  fileName?: string | null;
+  fileType?: SupportedFileType | null;
   text: string;
   pages?: ExtractedPage[];
 }): DocumentChunk[] {
@@ -198,9 +216,13 @@ export function chunkText(params: {
 
   for (const page of sourcePages) {
     const pageChunks = buildPageChunks({
-      documentId: params.documentId,
-      fileName: params.fileName,
-      fileType: params.fileType,
+      workspaceId: params.workspaceId,
+      sourceId: params.sourceId,
+      sourceName: params.sourceName,
+      sourceType: params.sourceType,
+      sourceUrl: params.sourceUrl ?? null,
+      fileName: params.fileName ?? null,
+      fileType: params.fileType ?? null,
       page,
       startingChunkIndex: chunks.length,
     });

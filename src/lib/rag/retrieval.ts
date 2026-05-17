@@ -7,7 +7,7 @@ const MIN_TOP_RELEVANCE_SCORE = 0.2;
 const MIN_RETAINED_SOURCE_SCORE = 0.15;
 const RELATIVE_SCORE_RATIO = 0.75;
 
-function filterRelevantChunks(chunks: RetrievedChunk[]): RetrievedChunk[] {
+export function filterRelevantChunks(chunks: RetrievedChunk[]): RetrievedChunk[] {
   if (chunks.length === 0) {
     return [];
   }
@@ -27,18 +27,20 @@ function filterRelevantChunks(chunks: RetrievedChunk[]): RetrievedChunk[] {
 }
 
 export async function retrieveRelevantChunks(params: {
-  documentId: string;
+  workspaceId?: string;
+  documentId?: string;
   question: string;
   storage?: VectorStoreProvider;
 }): Promise<RetrievedChunk[]> {
   const { ragTopK } = getServerConfig();
   const questionEmbedding = await embedQuery(params.question);
-  const chunks = await searchSimilarChunks(
-    params.documentId,
-    questionEmbedding,
-    ragTopK,
-    params.storage,
-  );
+  const chunks = await searchSimilarChunks({
+    workspaceId: params.workspaceId,
+    documentId: params.documentId,
+    queryEmbedding: questionEmbedding,
+    topK: ragTopK,
+    preferredProvider: params.storage,
+  });
 
   return filterRelevantChunks(chunks);
 }

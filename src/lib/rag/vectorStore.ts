@@ -5,6 +5,7 @@ import { getServerConfig } from "@/lib/server-config";
 import type {
   DocumentChunk,
   RetrievedChunk,
+  SupportedFileType,
   VectorStoreProvider,
 } from "@/lib/types";
 
@@ -14,7 +15,8 @@ interface MemoryPoint {
 }
 
 declare global {
-  var __askMyDocMemoryStore: Map<string, MemoryPoint[]> | undefined;
+  var __askMyDocMemoryWorkspaceStore: Map<string, MemoryPoint[]> | undefined;
+  var __askMyDocMemorySourceStore: Map<string, MemoryPoint[]> | undefined;
 }
 
 const QDRANT_PROVIDER = "qdrant" as const;
@@ -58,12 +60,22 @@ function createRetrievedChunk(
   };
 }
 
-function getMemoryStore(): Map<string, MemoryPoint[]> {
-  if (!globalThis.__askMyDocMemoryStore) {
-    globalThis.__askMyDocMemoryStore = new Map<string, MemoryPoint[]>();
+function getMemoryStores(): {
+  byWorkspace: Map<string, MemoryPoint[]>;
+  bySource: Map<string, MemoryPoint[]>;
+} {
+  if (!globalThis.__askMyDocMemoryWorkspaceStore) {
+    globalThis.__askMyDocMemoryWorkspaceStore = new Map<string, MemoryPoint[]>();
   }
 
-  return globalThis.__askMyDocMemoryStore;
+  if (!globalThis.__askMyDocMemorySourceStore) {
+    globalThis.__askMyDocMemorySourceStore = new Map<string, MemoryPoint[]>();
+  }
+
+  return {
+    byWorkspace: globalThis.__askMyDocMemoryWorkspaceStore,
+    bySource: globalThis.__askMyDocMemorySourceStore,
+  };
 }
 
 function cosineSimilarity(vectorA: number[], vectorB: number[]): number {
@@ -86,13 +98,15 @@ function cosineSimilarity(vectorA: number[], vectorB: number[]): number {
   return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
-function normalizeChunksForDocument(
-  documentId: string,
+function normalizeChunksForWorkspace(
+  workspaceId: string,
   chunks: DocumentChunk[],
 ): DocumentChunk[] {
   return chunks.map((chunk) => ({
     ...chunk,
-    documentId,
+    workspaceId,
+    sourceId: chunk.sourceId || chunk.documentId,
+    documentId: chunk.documentId || chunk.sourceId,
   }));
 }
 
@@ -123,11 +137,30 @@ function payloadToChunk(
     throw new AppError("A stored vector result was missing its payload.", 500);
   }
 
+  const fileType =
+    payload.fileType === null || payload.fileType === undefined
+      ? null
+      : (String(payload.fileType) as SupportedFileType);
+  const sourceId = String(payload.sourceId ?? payload.documentId);
+
   return {
     id: String(payload.id),
-    documentId: String(payload.documentId),
-    fileName: String(payload.fileName ?? payload.documentName ?? "unknown"),
-    fileType: String(payload.fileType) as DocumentChunk["fileType"],
+    workspaceId: String(payload.workspaceId ?? payload.documentId ?? sourceId),
+    sourceId,
+    documentId: String(payload.documentId ?? sourceId),
+    sourceName: String(
+      payload.sourceName ?? payload.fileName ?? payload.documentName ?? "unknown",
+    ),
+    sourceType: String(payload.sourceType ?? payload.fileType ?? "txt") as DocumentChunk["sourceType"],
+    sourceUrl:
+      payload.sourceUrl === null || payload.sourceUrl === undefined
+        ? null
+        : String(payload.sourceUrl),
+    fileName:
+      payload.fileName === null || payload.fileName === undefined
+        ? null
+        : String(payload.fileName),
+    fileType,
     chunkIndex: Number(payload.chunkIndex),
     pageNumber:
       payload.pageNumber === null || payload.pageNumber === undefined
@@ -156,6 +189,27 @@ async function isQdrantAvailable(): Promise<boolean> {
   }
 }
 
+async function ensurePayloadIndexes(
+  client: QdrantClient,
+  collectionName: string,
+): Promise<void> {
+  const fields = ["workspaceId", "documentId", "sourceId", "sourceType"];
+
+  await Promise.all(
+    fields.map(async (fieldName) => {
+      try {
+        await client.createPayloadIndex(collectionName, {
+          field_name: fieldName,
+          field_schema: "keyword",
+          wait: true,
+        });
+      } catch {
+        // Ignore duplicate or unsupported payload index creation errors.
+      }
+    }),
+  );
+}
+
 async function ensureQdrantCollection(vectorSize: number): Promise<void> {
   const client = getQdrantClient();
   const { qdrantCollectionName } = getServerConfig();
@@ -171,13 +225,9 @@ async function ensureQdrantCollection(vectorSize: number): Promise<void> {
         distance: "Cosine",
       },
     });
-
-    await client.createPayloadIndex(qdrantCollectionName, {
-      field_name: "documentId",
-      field_schema: "keyword",
-      wait: true,
-    });
   }
+
+  await ensurePayloadIndexes(client, qdrantCollectionName);
 }
 
 async function resolveProvider(
@@ -236,30 +286,45 @@ async function resolveProvider(
 }
 
 async function upsertChunksToMemoryStore(
-  documentId: string,
+  workspaceId: string,
   chunks: DocumentChunk[],
   embeddings: number[][],
 ): Promise<void> {
-  const store = getMemoryStore();
-  const normalizedChunks = normalizeChunksForDocument(documentId, chunks);
+  const stores = getMemoryStores();
+  const normalizedChunks = normalizeChunksForWorkspace(workspaceId, chunks);
+  const newPoints = normalizedChunks.map((chunk, index) => ({
+    chunk,
+    vector: embeddings[index],
+  }));
+  const sourceIds = new Set(newPoints.map((point) => point.chunk.sourceId));
+  const existingWorkspacePoints = stores.byWorkspace.get(workspaceId) ?? [];
 
-  store.set(
-    documentId,
-    normalizedChunks.map((chunk, index) => ({
-      chunk,
-      vector: embeddings[index],
-    })),
+  stores.byWorkspace.set(
+    workspaceId,
+    [
+      ...existingWorkspacePoints.filter(
+        (point) => !sourceIds.has(point.chunk.sourceId),
+      ),
+      ...newPoints,
+    ],
   );
+
+  for (const sourceId of sourceIds) {
+    stores.bySource.set(
+      sourceId,
+      newPoints.filter((point) => point.chunk.sourceId === sourceId),
+    );
+  }
 }
 
 async function upsertChunksToQdrant(
-  documentId: string,
+  workspaceId: string,
   chunks: DocumentChunk[],
   embeddings: number[][],
 ): Promise<void> {
   const client = getQdrantClient();
   const { qdrantCollectionName } = getServerConfig();
-  const normalizedChunks = normalizeChunksForDocument(documentId, chunks);
+  const normalizedChunks = normalizeChunksForWorkspace(workspaceId, chunks);
   const firstVector = embeddings[0];
 
   if (!firstVector) {
@@ -274,10 +339,15 @@ async function upsertChunksToQdrant(
       id: chunk.id,
       vector: embeddings[index],
       payload: {
-        documentId,
+        workspaceId,
+        sourceId: chunk.sourceId,
+        documentId: chunk.documentId,
+        sourceName: chunk.sourceName,
+        sourceType: chunk.sourceType,
+        sourceUrl: chunk.sourceUrl ?? null,
         text: chunk.text,
-        fileName: chunk.fileName,
-        fileType: chunk.fileType,
+        fileName: chunk.fileName ?? null,
+        fileType: chunk.fileType ?? null,
         chunkIndex: chunk.chunkIndex,
         pageNumber: chunk.pageNumber ?? null,
         snippet: chunk.snippet,
@@ -287,41 +357,55 @@ async function upsertChunksToQdrant(
   });
 }
 
-async function searchMemoryStore(
-  documentId: string,
-  queryEmbedding: number[],
-  topK: number,
-): Promise<RetrievedChunk[]> {
-  const store = getMemoryStore();
-  const points = store.get(documentId) ?? [];
+async function searchMemoryStore(params: {
+  workspaceId?: string;
+  documentId?: string;
+  queryEmbedding: number[];
+  topK: number;
+}): Promise<RetrievedChunk[]> {
+  const stores = getMemoryStores();
+  const points = params.workspaceId
+    ? stores.byWorkspace.get(params.workspaceId) ?? []
+    : stores.bySource.get(params.documentId ?? "") ?? [];
 
   return points
     .map((point) => ({
       chunk: point.chunk,
-      score: cosineSimilarity(queryEmbedding, point.vector),
+      score: cosineSimilarity(params.queryEmbedding, point.vector),
     }))
     .sort((left, right) => right.score - left.score)
-    .slice(0, topK)
+    .slice(0, params.topK)
     .map(({ chunk, score }, rank) => createRetrievedChunk(chunk, score, rank));
 }
 
-async function searchQdrantStore(
-  documentId: string,
-  queryEmbedding: number[],
-  topK: number,
-): Promise<RetrievedChunk[]> {
+async function searchQdrantStore(params: {
+  workspaceId?: string;
+  documentId?: string;
+  queryEmbedding: number[];
+  topK: number;
+}): Promise<RetrievedChunk[]> {
   const client = getQdrantClient();
   const { qdrantCollectionName } = getServerConfig();
+  const filterKey = params.workspaceId ? "workspaceId" : "documentId";
+  const filterValue = params.workspaceId ?? params.documentId;
+
+  if (!filterValue) {
+    throw new AppError(
+      "A workspaceId or documentId is required for retrieval.",
+      400,
+    );
+  }
+
   const results = await client.search(qdrantCollectionName, {
-    vector: queryEmbedding,
-    limit: topK,
+    vector: params.queryEmbedding,
+    limit: params.topK,
     with_payload: true,
     filter: {
       must: [
         {
-          key: "documentId",
+          key: filterKey,
           match: {
-            value: documentId,
+            value: filterValue,
           },
         },
       ],
@@ -335,7 +419,7 @@ async function searchQdrantStore(
 }
 
 export async function upsertChunks(
-  documentId: string,
+  workspaceId: string,
   chunks: DocumentChunk[],
   embeddings: number[][],
   preferredProvider?: VectorStoreProvider,
@@ -346,11 +430,11 @@ export async function upsertChunks(
 
   try {
     if (provider === QDRANT_PROVIDER) {
-      await upsertChunksToQdrant(documentId, chunks, embeddings);
+      await upsertChunksToQdrant(workspaceId, chunks, embeddings);
       return QDRANT_PROVIDER;
     }
 
-    await upsertChunksToMemoryStore(documentId, chunks, embeddings);
+    await upsertChunksToMemoryStore(workspaceId, chunks, embeddings);
     return MEMORY_PROVIDER;
   } catch (error) {
     if (
@@ -358,7 +442,7 @@ export async function upsertChunks(
       !preferredProvider &&
       isMemoryFallbackAllowed()
     ) {
-      await upsertChunksToMemoryStore(documentId, chunks, embeddings);
+      await upsertChunksToMemoryStore(workspaceId, chunks, embeddings);
       return MEMORY_PROVIDER;
     }
 
@@ -367,49 +451,50 @@ export async function upsertChunks(
     }
 
     if (error instanceof Error) {
-      throw new AppError(
-        `Vector storage failed: ${error.message}`,
-        502,
-      );
+      throw new AppError(`Vector storage failed: ${error.message}`, 502);
     }
 
     throw new AppError("Vector storage failed unexpectedly.", 502);
   }
 }
 
-export async function searchSimilarChunks(
-  documentId: string,
-  queryEmbedding: number[],
-  topK: number,
-  preferredProvider?: VectorStoreProvider,
-): Promise<RetrievedChunk[]> {
-  if (!documentId.trim()) {
-    throw new AppError("A documentId is required for retrieval.", 400);
+export async function searchSimilarChunks(params: {
+  workspaceId?: string;
+  documentId?: string;
+  queryEmbedding: number[];
+  topK: number;
+  preferredProvider?: VectorStoreProvider;
+}): Promise<RetrievedChunk[]> {
+  if (!params.workspaceId?.trim() && !params.documentId?.trim()) {
+    throw new AppError(
+      "A workspaceId or documentId is required for retrieval.",
+      400,
+    );
   }
 
-  if (queryEmbedding.length === 0) {
+  if (params.queryEmbedding.length === 0) {
     throw new AppError("A query embedding is required for retrieval.", 400);
   }
 
-  if (topK <= 0) {
+  if (params.topK <= 0) {
     throw new AppError("topK must be greater than zero for retrieval.", 400);
   }
 
-  const provider = await resolveProvider(preferredProvider);
+  const provider = await resolveProvider(params.preferredProvider);
 
   try {
     if (provider === QDRANT_PROVIDER) {
-      return await searchQdrantStore(documentId, queryEmbedding, topK);
+      return await searchQdrantStore(params);
     }
 
-    return await searchMemoryStore(documentId, queryEmbedding, topK);
+    return await searchMemoryStore(params);
   } catch (error) {
     if (
       provider === QDRANT_PROVIDER &&
-      !preferredProvider &&
+      !params.preferredProvider &&
       isMemoryFallbackAllowed()
     ) {
-      return searchMemoryStore(documentId, queryEmbedding, topK);
+      return searchMemoryStore(params);
     }
 
     if (error instanceof AppError) {
@@ -417,10 +502,7 @@ export async function searchSimilarChunks(
     }
 
     if (error instanceof Error) {
-      throw new AppError(
-        `Vector retrieval failed: ${error.message}`,
-        502,
-      );
+      throw new AppError(`Vector retrieval failed: ${error.message}`, 502);
     }
 
     throw new AppError("Vector retrieval failed unexpectedly.", 502);

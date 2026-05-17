@@ -2,7 +2,7 @@ import { getGeminiClient } from "@/lib/rag/gemini";
 import { getServerConfig } from "@/lib/server-config";
 import type { RetrievedChunk } from "@/lib/types";
 
-const EMPTY_ANSWER =
+export const EMPTY_ANSWER =
   "I could not find this information in the uploaded document.";
 
 const STRICT_SYSTEM_PROMPT = `
@@ -39,7 +39,7 @@ function formatSources(sources: RetrievedChunk[]): string {
   return sources
     .map(
       (source) =>
-        `Chunk ${source.chunkIndex + 1}${source.pageNumber ? ` (page ${source.pageNumber})` : ""} from ${source.fileName}\n${source.text}`,
+        `[${source.sourceType.toUpperCase()}] ${source.sourceName}${source.pageNumber ? ` (page ${source.pageNumber})` : ""}${source.sourceUrl ? ` (${source.sourceUrl})` : ""}\nChunk ${source.chunkIndex + 1}\n${source.text}`,
     )
     .join("\n\n");
 }

@@ -11,8 +11,17 @@ import {
   useTransition,
 } from "react";
 
+import { ingestUrlToWorkspace } from "@/lib/client/ingest-url";
 import { uploadDocumentWithProgress } from "@/lib/client/upload-document";
-import type { UploadResult } from "@/lib/types";
+import type {
+  ChatSource,
+  CorrectiveRagMetadata,
+  IndexedSourceResult,
+  SourceType,
+  UploadResult,
+  VectorStoreProvider,
+  WorkspaceSource,
+} from "@/lib/types";
 import {
   DEFAULT_MAX_UPLOAD_SIZE_MB,
   detectUploadedFileType,
@@ -24,18 +33,13 @@ interface ChatTurn {
   role: "user" | "assistant";
   content: string;
   sources?: ChatSource[];
-}
-
-interface ChatSource {
-  chunkIndex: number;
-  text: string;
-  score: number;
-  page: number | null;
+  corrective?: CorrectiveRagMetadata;
 }
 
 interface ChatResponse {
   answer: string;
   sources: ChatSource[];
+  corrective?: CorrectiveRagMetadata;
   error?: string;
 }
 
@@ -51,23 +55,149 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function formatSourceTypeLabel(sourceType: SourceType): string {
+  return sourceType.toUpperCase();
+}
+
+function formatCorrectiveStatus(value: boolean): string {
+  return value ? "Passed" : "Failed";
+}
+
+function formatSourceLocation(source: { page: number | null; url?: string }): string | null {
+  if (source.page) {
+    return `page ${source.page}`;
+  }
+
+  if (source.url) {
+    try {
+      const parsedUrl = new URL(source.url);
+      return `${parsedUrl.hostname}${parsedUrl.pathname === "/" ? "" : parsedUrl.pathname}`;
+    } catch {
+      return source.url;
+    }
+  }
+
+  return null;
+}
+
+function upsertWorkspaceSources(
+  currentSources: WorkspaceSource[],
+  nextSource: WorkspaceSource,
+): WorkspaceSource[] {
+  const remainingSources = currentSources.filter(
+    (source) => source.sourceId !== nextSource.sourceId,
+  );
+
+  return [...remainingSources, nextSource];
+}
+
+function SourceTypeBadge({ sourceType }: { sourceType: SourceType }) {
+  return (
+    <span className="rounded-full bg-[color:var(--color-accent-soft)] px-2.5 py-1 text-[11px] font-semibold tracking-[0.18em] text-[color:var(--color-accent-strong)] uppercase">
+      {formatSourceTypeLabel(sourceType)}
+    </span>
+  );
+}
+
 function SourceCard({ source, index }: { source: ChatSource; index: number }) {
+  const sourceLocation = formatSourceLocation(source);
+
   return (
     <article className="rounded-2xl border border-[color:var(--color-border)] bg-[color:var(--color-paper)]/80 p-4 shadow-[0_12px_30px_rgba(15,23,42,0.05)]">
-      <div className="mb-2 flex items-center justify-between gap-3">
-        <span className="rounded-full bg-[color:var(--color-accent-soft)] px-2.5 py-1 text-[11px] font-semibold tracking-[0.18em] text-[color:var(--color-accent-strong)] uppercase">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <SourceTypeBadge sourceType={source.sourceType} />
+          <span className="text-sm font-semibold text-[color:var(--color-ink)]">
+            {source.sourceName}
+          </span>
+        </div>
+        <span className="text-xs text-[color:var(--color-muted)]">
           Source {index + 1}
         </span>
-        <span className="text-xs text-[color:var(--color-muted)]">
-          chunk {source.chunkIndex + 1}
-          {source.page ? ` - page ${source.page}` : ""}
-          {" - "}score {source.score.toFixed(3)}
-        </span>
       </div>
+      <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-[color:var(--color-muted)]">
+        <span>chunk {source.chunkIndex + 1}</span>
+        <span>score {source.score.toFixed(3)}</span>
+        {sourceLocation ? <span>{sourceLocation}</span> : null}
+      </div>
+      {source.url ? (
+        <p className="mb-2 truncate text-xs text-[color:var(--color-muted)]">
+          {source.url}
+        </p>
+      ) : null}
       <p className="text-sm leading-7 text-[color:var(--color-ink)]/80">
         {source.text}
       </p>
     </article>
+  );
+}
+
+function WorkspaceSourceRow({ source }: { source: WorkspaceSource }) {
+  const sourceLocation = source.url
+    ? formatSourceLocation({ page: null, url: source.url })
+    : null;
+
+  return (
+    <article className="rounded-2xl border border-[color:var(--color-border)] bg-white px-4 py-4 shadow-[inset_0_0_0_1px_rgba(148,163,184,0.12)]">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <SourceTypeBadge sourceType={source.sourceType} />
+            <p className="truncate text-sm font-semibold text-[color:var(--color-ink)]">
+              {source.sourceName}
+            </p>
+          </div>
+          {sourceLocation ? (
+            <p className="mt-2 truncate text-xs text-[color:var(--color-muted)]">
+              {sourceLocation}
+            </p>
+          ) : null}
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-[color:var(--color-muted)]">
+            <span>{source.chunkCount} chunks</span>
+            {source.pageCount ? <span>{source.pageCount} pages</span> : null}
+          </div>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function CorrectiveRagCard({
+  corrective,
+}: {
+  corrective: CorrectiveRagMetadata;
+}) {
+  return (
+    <div className="mt-4 rounded-2xl border border-[color:var(--color-border)] bg-[color:var(--color-paper)]/80 p-4">
+      <p className="text-[11px] font-semibold tracking-[0.18em] text-[color:var(--color-muted)] uppercase">
+        Corrective RAG
+      </p>
+      <div className="mt-3 grid gap-2 text-sm leading-6 text-[color:var(--color-ink)]/85">
+        <p>
+          Initial retrieval:{" "}
+          <span className="font-medium">
+            {formatCorrectiveStatus(corrective.initialRetrievalPassed)}
+          </span>
+        </p>
+        <p>
+          Query rewritten:{" "}
+          <span className="font-medium">
+            {corrective.rewrittenQuery ? "Yes" : "No"}
+          </span>
+        </p>
+        <p>
+          Final retrieval:{" "}
+          <span className="font-medium">
+            {formatCorrectiveStatus(corrective.finalRetrievalPassed)}
+          </span>
+        </p>
+        {corrective.rewrittenQuery ? (
+          <p className="text-xs leading-6 text-[color:var(--color-muted)]">
+            Rewritten query: {corrective.rewrittenQuery}
+          </p>
+        ) : null}
+      </div>
+    </div>
   );
 }
 
@@ -92,13 +222,16 @@ function MessageBubble({ message }: { message: ChatTurn }) {
             <div className="grid gap-3">
               {message.sources.map((source, index) => (
                 <SourceCard
-                  key={`${message.id}-${source.chunkIndex}-${index}`}
+                  key={`${message.id}-${source.sourceId}-${source.chunkIndex}-${index}`}
                   source={source}
                   index={index}
                 />
               ))}
             </div>
           </div>
+        ) : null}
+        {isAssistant && message.corrective ? (
+          <CorrectiveRagCard corrective={message.corrective} />
         ) : null}
       </div>
     </div>
@@ -107,13 +240,19 @@ function MessageBubble({ message }: { message: ChatTurn }) {
 
 export function AskMyDocApp() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [uploadedDocument, setUploadedDocument] = useState<UploadResult | null>(
-    null,
-  );
+  const [workspaceId, setWorkspaceId] = useState<string | null>(null);
+  const [workspaceStorage, setWorkspaceStorage] =
+    useState<VectorStoreProvider | null>(null);
+  const [workspaceSources, setWorkspaceSources] = useState<WorkspaceSource[]>([]);
+  const [latestIndexedSource, setLatestIndexedSource] =
+    useState<IndexedSourceResult | null>(null);
   const [messages, setMessages] = useState<ChatTurn[]>([]);
   const [question, setQuestion] = useState("");
+  const [urlInput, setUrlInput] = useState("");
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploadSuccess, setUploadSuccess] = useState<string | null>(null);
+  const [urlError, setUrlError] = useState<string | null>(null);
+  const [urlSuccess, setUrlSuccess] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadStatus, setUploadStatus] = useState<
     "uploading" | "processing" | null
@@ -121,6 +260,7 @@ export function AskMyDocApp() {
   const [isDragActive, setIsDragActive] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
+  const [isAddingUrl, setIsAddingUrl] = useState(false);
   const [isAsking, setIsAsking] = useState(false);
   const [isPending, startTransition] = useTransition();
   const messagesRef = useRef<HTMLDivElement>(null);
@@ -139,7 +279,7 @@ export function AskMyDocApp() {
   }, [messages.length]);
 
   useEffect(() => {
-    if (!uploadedDocument) {
+    if (workspaceSources.length === 0) {
       return;
     }
 
@@ -148,7 +288,7 @@ export function AskMyDocApp() {
       behavior: "smooth",
       block: "center",
     });
-  }, [uploadedDocument]);
+  }, [workspaceSources.length]);
 
   function applySelectedFile(file: File | null): boolean {
     setUploadError(null);
@@ -234,6 +374,16 @@ export function AskMyDocApp() {
     applySelectedFile(files[0] ?? null);
   }
 
+  function rememberIndexedSource(source: IndexedSourceResult | UploadResult) {
+    startTransition(() => {
+      setWorkspaceId(source.workspaceId);
+      setWorkspaceStorage(source.storage);
+      setLatestIndexedSource(source);
+      setWorkspaceSources((current) => upsertWorkspaceSources(current, source));
+      setQuestion("");
+    });
+  }
+
   async function handleUpload(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
@@ -245,6 +395,8 @@ export function AskMyDocApp() {
     setIsUploading(true);
     setUploadError(null);
     setUploadSuccess(null);
+    setUrlError(null);
+    setUrlSuccess(null);
     setUploadProgress(0);
     setUploadStatus("uploading");
     setChatError(null);
@@ -256,16 +408,23 @@ export function AskMyDocApp() {
           setUploadProgress(progress);
           setUploadStatus(status);
         },
+        {
+          workspaceId: workspaceId ?? undefined,
+          storage: workspaceStorage ?? undefined,
+        },
       );
 
-      startTransition(() => {
-        setUploadedDocument(payload);
-        setMessages([]);
-        setQuestion("");
-      });
+      rememberIndexedSource(payload);
       setUploadSuccess(
-        `Successfully indexed ${payload.fileName} into ${payload.chunkCount} chunks.`,
+        workspaceSources.length > 0
+          ? `Added ${payload.sourceName} to the workspace.`
+          : `Indexed ${payload.sourceName} into the workspace.`,
       );
+      setSelectedFile(null);
+
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
     } catch (error) {
       setUploadError(
         error instanceof Error ? error.message : "Upload failed.",
@@ -277,18 +436,58 @@ export function AskMyDocApp() {
     }
   }
 
+  async function handleAddUrl(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    const trimmedUrl = urlInput.trim();
+
+    if (!trimmedUrl) {
+      setUrlError("Paste a public web page URL before adding it.");
+      return;
+    }
+
+    setIsAddingUrl(true);
+    setUrlError(null);
+    setUrlSuccess(null);
+    setUploadError(null);
+    setUploadSuccess(null);
+    setChatError(null);
+
+    try {
+      const payload = await ingestUrlToWorkspace({
+        url: trimmedUrl,
+        workspaceId: workspaceId ?? undefined,
+        storage: workspaceStorage ?? undefined,
+      });
+
+      rememberIndexedSource(payload);
+      setUrlInput("");
+      setUrlSuccess(
+        workspaceSources.length > 0
+          ? `Added ${payload.sourceName} to the workspace.`
+          : `Indexed ${payload.sourceName} into the workspace.`,
+      );
+    } catch (error) {
+      setUrlError(
+        error instanceof Error ? error.message : "We couldn't add that URL.",
+      );
+    } finally {
+      setIsAddingUrl(false);
+    }
+  }
+
   async function handleAsk(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
-    if (!uploadedDocument) {
-      setChatError("Upload a document before asking questions.");
+    if (workspaceSources.length === 0) {
+      setChatError("Add a source before asking questions.");
       return;
     }
 
     const trimmedQuestion = question.trim();
 
     if (!trimmedQuestion) {
-      setChatError("Enter a question to search the uploaded document.");
+      setChatError("Enter a question to search the active workspace.");
       return;
     }
 
@@ -313,8 +512,9 @@ export function AskMyDocApp() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          documentId: uploadedDocument.documentId,
-          storage: uploadedDocument.storage,
+          workspaceId: workspaceId ?? undefined,
+          documentId: latestIndexedSource?.documentId,
+          storage: workspaceStorage ?? undefined,
           question: trimmedQuestion,
         }),
       });
@@ -329,6 +529,7 @@ export function AskMyDocApp() {
         role: "assistant",
         content: payload.answer,
         sources: payload.sources,
+        corrective: payload.corrective,
       };
 
       startTransition(() => {
@@ -343,13 +544,19 @@ export function AskMyDocApp() {
     }
   }
 
-  function handleResetDocument() {
-    setUploadedDocument(null);
+  function handleClearWorkspace() {
+    setWorkspaceId(null);
+    setWorkspaceStorage(null);
+    setWorkspaceSources([]);
+    setLatestIndexedSource(null);
     setSelectedFile(null);
     setMessages([]);
     setQuestion("");
+    setUrlInput("");
     setUploadError(null);
     setUploadSuccess(null);
+    setUrlError(null);
+    setUrlSuccess(null);
     setUploadProgress(0);
     setUploadStatus(null);
     setChatError(null);
@@ -360,13 +567,22 @@ export function AskMyDocApp() {
   }
 
   const suggestions = [
-    "Summarize the main argument of this document.",
+    "Summarize the main argument of these sources.",
     "What are the key numbers or metrics mentioned here?",
     "List the most important takeaways with citations.",
   ];
-  const indexedDocumentLabel = uploadedDocument
-    ? `${uploadedDocument.fileName} (${uploadedDocument.fileType.toUpperCase()})`
-    : "No document indexed yet";
+  const totalChunks = workspaceSources.reduce(
+    (chunkCount, source) => chunkCount + source.chunkCount,
+    0,
+  );
+  const workspaceLabel =
+    workspaceSources.length === 0
+      ? "No workspace sources yet"
+      : workspaceSources.length === 1
+        ? workspaceSources[0]?.sourceName ?? "1 source in workspace"
+        : `${workspaceSources.length} sources in workspace`;
+  const latestSourceLabel =
+    latestIndexedSource?.sourceName ?? "No source indexed yet";
 
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-7xl flex-col px-4 py-8 sm:px-6 lg:px-8">
@@ -382,18 +598,19 @@ export function AskMyDocApp() {
                 Ask My Doc RAG
               </h1>
               <p className="mt-4 max-w-2xl text-base leading-8 text-[color:var(--color-muted)] sm:text-lg">
-                Upload a PDF, TXT, or CSV file and ask questions grounded in that document.
+                Upload PDF, TXT, and CSV files, add public web pages, and ask grounded questions across the active workspace.
               </p>
               <p className="mt-3 max-w-2xl text-sm leading-7 text-[color:var(--color-muted)] sm:text-base">
                 The app extracts text, creates chunks, stores Gemini embeddings,
-                retrieves the most relevant passages, and answers only from that retrieved context.
+                retrieves the most relevant passages from the active workspace,
+                and answers only from that retrieved context.
               </p>
             </div>
 
             <div className="grid w-full max-w-md gap-3 rounded-[28px] border border-[color:var(--color-border)] bg-white/75 p-5 text-sm text-[color:var(--color-ink)] shadow-[0_14px_36px_rgba(15,23,42,0.06)]">
               <div className="flex items-center justify-between gap-4">
-                <span className="font-medium">Supported files</span>
-                <span className="text-[color:var(--color-muted)]">PDF, TXT, CSV</span>
+                <span className="font-medium">Supported sources</span>
+                <span className="text-[color:var(--color-muted)]">PDF, TXT, CSV, WEB</span>
               </div>
               <div className="flex items-center justify-between gap-4">
                 <span className="font-medium">Vector storage</span>
@@ -402,8 +619,8 @@ export function AskMyDocApp() {
                 </span>
               </div>
               <div className="flex items-center justify-between gap-4">
-                <span className="font-medium">Answer policy</span>
-                <span className="text-[color:var(--color-muted)]">Document-grounded only</span>
+                <span className="font-medium">Workspace mode</span>
+                <span className="text-[color:var(--color-muted)]">Multi-source grounded chat</span>
               </div>
             </div>
           </div>
@@ -416,17 +633,17 @@ export function AskMyDocApp() {
                     Upload a PDF, TXT, or CSV document
                   </h2>
                   <p className="mt-2 text-sm leading-7 text-[color:var(--color-muted)]">
-                    The file is extracted, chunked, embedded, and indexed before the chat unlocks.
+                    Each source is extracted, chunked, embedded, and indexed into the active workspace before chat uses it.
                   </p>
                 </div>
 
-                {uploadedDocument ? (
+                {workspaceSources.length > 0 ? (
                   <button
                     type="button"
-                    onClick={handleResetDocument}
+                    onClick={handleClearWorkspace}
                     className="shrink-0 rounded-full border border-[color:var(--color-border)] px-3 py-1.5 text-xs font-semibold tracking-[0.16em] text-[color:var(--color-accent-strong)] uppercase transition hover:border-[color:var(--color-accent-strong)] hover:bg-[color:var(--color-accent-soft)]"
                   >
-                    Replace
+                    Clear workspace
                   </button>
                 ) : null}
               </div>
@@ -540,59 +757,80 @@ export function AskMyDocApp() {
                 ) : null}
               </form>
 
-              {uploadedDocument ? (
-                <div className="mt-6 grid min-w-0 gap-3 overflow-hidden rounded-[26px] border border-[color:var(--color-border)] bg-[color:var(--color-paper)] p-5">
-                  <div className="flex items-center justify-between gap-3">
-                    <h3 className="text-sm font-semibold tracking-[0.18em] text-[color:var(--color-accent-strong)] uppercase">
-                      Indexed document
-                    </h3>
-                    <span className="rounded-full bg-white px-3 py-1 text-xs text-[color:var(--color-muted)] shadow-[inset_0_0_0_1px_rgba(148,163,184,0.16)]">
-                      {uploadedDocument.storage}
-                    </span>
-                  </div>
-                  <p className="truncate text-lg font-semibold text-[color:var(--color-ink)]">
-                    {uploadedDocument.fileName}
+              <div className="mt-6 rounded-[26px] border border-[color:var(--color-border)] bg-[color:var(--color-paper)] p-5">
+                <h3 className="text-sm font-semibold tracking-[0.18em] text-[color:var(--color-accent-strong)] uppercase">
+                  Add a public web page
+                </h3>
+                <form className="mt-4 grid gap-3" onSubmit={handleAddUrl}>
+                  <input
+                    type="url"
+                    value={urlInput}
+                    onChange={(event) => {
+                      setUrlInput(event.target.value);
+                      setUrlError(null);
+                      setUrlSuccess(null);
+                    }}
+                    placeholder="Paste a public web page URL"
+                    className="w-full rounded-2xl border border-[color:var(--color-border)] bg-white px-4 py-3 text-sm text-[color:var(--color-ink)] outline-none transition placeholder:text-[color:var(--color-muted)] focus:border-[color:var(--color-accent-strong)]"
+                  />
+                  <button
+                    type="submit"
+                    disabled={isAddingUrl || !urlInput.trim()}
+                    className="inline-flex w-full items-center justify-center rounded-full border border-[color:var(--color-border)] bg-white px-5 py-3 text-sm font-semibold text-[color:var(--color-ink)] transition hover:border-[color:var(--color-accent-strong)] hover:bg-[color:var(--color-accent-soft)] disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {isAddingUrl ? "Fetching and indexing..." : "Add URL"}
+                  </button>
+                </form>
+                {urlError ? (
+                  <p className="mt-3 rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+                    {urlError}
                   </p>
-                  <div className="grid gap-2 text-sm text-[color:var(--color-muted)]">
-                    <div className="flex items-center justify-between gap-3">
-                      <span>File type</span>
-                      <span className="font-medium text-[color:var(--color-ink)] uppercase">
-                        {uploadedDocument.fileType}
-                      </span>
-                    </div>
-                    <div className="flex items-center justify-between gap-3">
-                      <span>Chunks indexed</span>
-                      <span className="font-medium text-[color:var(--color-ink)]">
-                        {uploadedDocument.chunkCount}
-                      </span>
-                    </div>
-                    <div className="flex items-center justify-between gap-3">
-                      <span>Pages extracted</span>
-                      <span className="font-medium text-[color:var(--color-ink)]">
-                        {uploadedDocument.pageCount}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <div className="mt-6 min-w-0 overflow-hidden rounded-[26px] border border-[color:var(--color-border)] bg-[color:var(--color-paper)] p-5">
+                ) : null}
+                {urlSuccess ? (
+                  <p className="mt-3 rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
+                    {urlSuccess}
+                  </p>
+                ) : null}
+              </div>
+
+              <div className="mt-6 min-w-0 overflow-hidden rounded-[26px] border border-[color:var(--color-border)] bg-[color:var(--color-paper)] p-5">
+                <div className="flex items-center justify-between gap-3">
                   <h3 className="text-sm font-semibold tracking-[0.18em] text-[color:var(--color-accent-strong)] uppercase">
-                    Suggested prompts
+                    Workspace sources
                   </h3>
+                  {workspaceSources.length > 0 ? (
+                    <span className="rounded-full bg-white px-3 py-1 text-xs text-[color:var(--color-muted)] shadow-[inset_0_0_0_1px_rgba(148,163,184,0.16)]">
+                      {workspaceSources.length}
+                    </span>
+                  ) : null}
+                </div>
+
+                {workspaceSources.length > 0 ? (
                   <div className="mt-4 grid gap-3">
-                    {suggestions.map((suggestion) => (
-                      <button
-                        key={suggestion}
-                        type="button"
-                        onClick={() => setQuestion(suggestion)}
-                        className="rounded-2xl border border-[color:var(--color-border)] bg-white px-4 py-3 text-left text-sm leading-7 text-[color:var(--color-ink)] transition hover:border-[color:var(--color-accent-strong)] hover:bg-[color:var(--color-accent-soft)]"
-                      >
-                        {suggestion}
-                      </button>
+                    {workspaceSources.map((source) => (
+                      <WorkspaceSourceRow key={source.sourceId} source={source} />
                     ))}
                   </div>
-                </div>
-              )}
+                ) : (
+                  <div className="mt-4 grid gap-3">
+                    <p className="rounded-2xl border border-[color:var(--color-border)] bg-white px-4 py-4 text-sm leading-7 text-[color:var(--color-muted)]">
+                      No sources are indexed in this workspace yet.
+                    </p>
+                    <div className="grid gap-3">
+                      {suggestions.map((suggestion) => (
+                        <button
+                          key={suggestion}
+                          type="button"
+                          onClick={() => setQuestion(suggestion)}
+                          className="rounded-2xl border border-[color:var(--color-border)] bg-white px-4 py-3 text-left text-sm leading-7 text-[color:var(--color-ink)] transition hover:border-[color:var(--color-accent-strong)] hover:bg-[color:var(--color-accent-soft)]"
+                        >
+                          {suggestion}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
             </section>
 
             <section className="flex min-h-[640px] min-w-0 w-full flex-col overflow-hidden rounded-[30px] border border-[color:var(--color-border)] bg-white/82 shadow-[0_18px_40px_rgba(15,23,42,0.05)]">
@@ -602,21 +840,21 @@ export function AskMyDocApp() {
                     Grounded chat
                   </h2>
                   <p className="mt-1 text-sm leading-7 text-[color:var(--color-muted)]">
-                    Answers are generated from the retrieved document chunks only.
+                    Answers are generated from retrieved chunks across the active workspace sources only.
                   </p>
                   <div className="mt-3 flex min-w-0 flex-wrap items-center gap-2 text-xs text-[color:var(--color-muted)]">
                     <span className="rounded-full bg-[color:var(--color-paper)] px-3 py-1 shadow-[inset_0_0_0_1px_rgba(148,163,184,0.16)]">
-                      Current document: {indexedDocumentLabel}
+                      Active workspace: {workspaceLabel}
                     </span>
-                    {uploadedDocument ? (
+                    {workspaceSources.length > 0 ? (
                       <span className="rounded-full bg-[color:var(--color-paper)] px-3 py-1 shadow-[inset_0_0_0_1px_rgba(148,163,184,0.16)]">
-                        {uploadedDocument.chunkCount} chunks indexed
+                        {totalChunks} chunks indexed
                       </span>
                     ) : null}
                   </div>
                 </div>
                 <div className="rounded-full bg-[color:var(--color-accent-soft)] px-3 py-1.5 text-xs font-semibold tracking-[0.18em] text-[color:var(--color-accent-strong)] uppercase">
-                  {uploadedDocument ? "Ready" : "Waiting for upload"}
+                  {workspaceSources.length > 0 ? "Ready" : "Waiting for sources"}
                 </div>
               </div>
 
@@ -631,15 +869,15 @@ export function AskMyDocApp() {
                   <div className="grid h-full place-items-center">
                     <div className="max-w-xl rounded-[32px] border border-dashed border-[color:var(--color-border)] bg-[color:var(--color-paper)] px-8 py-10 text-center">
                       <p className="text-sm font-semibold tracking-[0.18em] text-[color:var(--color-accent-strong)] uppercase">
-                        NotebookLM-style flow
+                        Workspace flow
                       </p>
                       <h3 className="mt-4 text-3xl font-semibold text-[color:var(--color-ink)]">
-                        {uploadedDocument
-                          ? "Your document is indexed. Ask the first question."
-                          : "Upload a document to begin the RAG pipeline."}
+                        {workspaceSources.length > 0
+                          ? "Your workspace is indexed. Ask the next question."
+                          : "Upload a file or add a public page to begin the RAG pipeline."}
                       </h3>
                       <p className="mt-4 text-base leading-8 text-[color:var(--color-muted)]">
-                        Extraction, chunking, embeddings, vector search, and grounded generation all happen on the server before an answer reaches the chat.
+                        Extraction, chunking, embeddings, workspace retrieval, corrective RAG checks, and grounded generation all happen on the server before an answer reaches the chat.
                       </p>
                     </div>
                   </div>
@@ -651,11 +889,11 @@ export function AskMyDocApp() {
                   <textarea
                     ref={chatComposerRef}
                     className="min-h-32 w-full resize-none rounded-[28px] border border-[color:var(--color-border)] bg-[color:var(--color-paper)] px-5 py-4 text-sm leading-7 text-[color:var(--color-ink)] outline-none transition placeholder:text-[color:var(--color-muted)] focus:border-[color:var(--color-accent-strong)] focus:bg-white"
-                    disabled={!uploadedDocument || isAsking}
+                    disabled={workspaceSources.length === 0 || isAsking}
                     placeholder={
-                      uploadedDocument
-                        ? "Ask a question about the uploaded document..."
-                        : "Upload a document first to unlock grounded chat."
+                      workspaceSources.length > 0
+                        ? "Ask a question about the active workspace..."
+                        : "Upload a file or add a public page first to unlock grounded chat."
                     }
                     value={question}
                     onChange={(event) => setQuestion(event.target.value)}
@@ -663,13 +901,13 @@ export function AskMyDocApp() {
 
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                     <p className="text-sm leading-7 text-[color:var(--color-muted)]">
-                      {uploadedDocument
-                        ? `Questions are answered only from ${uploadedDocument.fileName}.`
-                        : "Upload a document first to unlock document-grounded answers."}
+                      {workspaceSources.length > 0
+                        ? `Questions are answered only from the active workspace sources. Latest source: ${latestSourceLabel}.`
+                        : "Add a source first to unlock workspace-grounded answers."}
                     </p>
                     <button
                       type="submit"
-                      disabled={!uploadedDocument || !question.trim() || isAsking}
+                      disabled={workspaceSources.length === 0 || !question.trim() || isAsking}
                       className="inline-flex w-full items-center justify-center rounded-full bg-[color:var(--color-ink)] px-5 py-3 text-sm font-semibold text-white transition hover:brightness-95 disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto"
                     >
                       {isAsking ? "Searching and answering..." : "Ask My Doc"}
